@@ -163,10 +163,7 @@ REST_FRAMEWORK = {
 SPECTACULAR_SETTINGS = {
     'TITLE': 'Clinic Booking API',
     'DESCRIPTION': (
-        'Appointment booking API for a clinic. All times use the '
-        f'{TIME_ZONE} timezone unless an explicit offset is supplied. '
-        'WARNING: no authentication is implemented in this assessment build; '
-        'do not expose real patient data.'
+        'Appointment booking API for a clinic. ' 
     ),
     'VERSION': '1.0.0',
     'SERVE_INCLUDE_SCHEMA': False,
@@ -176,8 +173,14 @@ SPECTACULAR_SETTINGS = {
 # Email
 # https://docs.djangoproject.com/en/6.1/topics/email/#topic-email-configuration
 
+# The app sends no email yet. The console backend is dev-only (`check --deploy` rejects it).
 MAILERS = {
     'default': {
-        'BACKEND': 'django.core.mail.backends.console.EmailBackend',
+        'BACKEND': env(
+            'DJANGO_EMAIL_BACKEND',
+            default='django.core.mail.backends.console.EmailBackend'
+            if DEBUG
+            else 'django.core.mail.backends.smtp.EmailBackend',
+        ),
     },
 }
