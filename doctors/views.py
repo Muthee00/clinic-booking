@@ -36,6 +36,8 @@ class DoctorAvailabilityView(APIView):
             'date': date,
             'timezone': settings.TIME_ZONE,
             'slot_minutes': services.SLOT_MINUTES,
-            'slots': [{'starts_at': s, 'ends_at': s + services.SLOT_DURATION} for s in slots],
+            'slots': [
+                {'time': f'{s:%H:%M}', 'starts_at': s, 'ends_at': s + services.SLOT_DURATION} for s in slots
+            ],
         }
         return Response(AvailabilitySerializer(payload).data)

@@ -72,6 +72,31 @@ class BookAppointmentTests(BookingTestCase):
         self.assertEqual(appointment.starts_at, self.slot)
         self.assertEqual(appointment.ends_at - appointment.starts_at, timedelta(minutes=30))
 
+    def test_booking_with_date_and_time(self):
+        response = self.client.post(
+            reverse('appointment-create'),
+            {'doctor': self.doctor.pk, 'patient': self.patient.pk, 'date': self.day.isoformat(), 'time': '10:00'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(Appointment.objects.get(pk=response.data['id']).starts_at, self.slot)
+        self.assertEqual(
+            (response.data['date'], response.data['start_time'], response.data['end_time']),
+            (self.day.isoformat(), '10:00', '10:30'),
+        )
+
+    def test_slot_input_requires_exactly_one_format(self):
+        base = {'doctor': self.doctor.pk, 'patient': self.patient.pk}
+        for extra in (
+            {},
+            {'date': self.day.isoformat()},
+            {'date': self.day.isoformat(), 'time': '10:00', 'starts_at': self.slot.isoformat()},
+        ):
+            response = self.client.post(reverse('appointment-create'), {**base, **extra}, format='json')
+            self.assertEqual(response.status_code, 400, extra)
+        self.assertFalse(Appointment.objects.exists())
+
     def test_duplicate_booking_is_rejected(self):
         self.assertEqual(self.book(self.slot).status_code, 201)
 
@@ -223,6 +248,16 @@ class RescheduleAppointmentTests(BookingTestCase):
         self.assertIn(self.slot, self.available_starts())
         self.assertNotIn(self.new_slot, self.available_starts())
 
+    def test_reschedule_with_date_and_time(self):
+        response = self.client.patch(
+            reverse('appointment-reschedule', args=[self.appointment_id]),
+            {'date': self.day.isoformat(), 'time': '11:00'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(Appointment.objects.get(pk=self.appointment_id).starts_at, self.new_slot)
+
     def test_reschedule_to_occupied_slot_preserves_original(self):
         self.book(self.new_slot, patient=self.other_patient)
 
@@ -275,6 +310,28 @@ class PatientAppointmentsTests(BookingTestCase):
 
     def test_unknown_patient_returns_404(self):
         self.assertEqual(self.client.get(reverse('patient-appointments', args=[9999])).status_code, 404)
+
+
+class AdminTests(BookingTestCase):
+    def test_admin_computes_end_time_from_start(self):
+        from django.contrib.auth.models import User
+
+        self.client.force_login(User.objects.create_superuser('admin', 'admin@example.com', 'pw'))
+        response = self.client.post(
+            reverse('admin:appointments_appointment_add'),
+            {
+                'doctor': self.doctor.pk,
+                'patient': self.patient.pk,
+                'starts_at_0': self.day.isoformat(),
+                'starts_at_1': '10:00',
+                'status': 'booked',
+                'cancellation_reason': '',
+            },
+        )
+
+        self.assertEqual(response.status_code, 302)
+        appointment = Appointment.objects.get()
+        self.assertEqual(appointment.ends_at, self.slot + timedelta(minutes=30))
 
 
 class SchemaTests(TestCase):

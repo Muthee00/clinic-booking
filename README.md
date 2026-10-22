@@ -196,7 +196,7 @@ SQLite and PostgreSQL. Cancelled rows are excluded from the index, so a cancelle
 
 All enforced in `appointments/services.py`:
 
-1. Appointments last exactly 30 minutes (`ends_at` is computed by the server; clients send only `starts_at`).
+1. Appointments last exactly 30 minutes. `ends_at` is computed by the server; clients send only the start, either as `date` + `time` (clinic time, e.g. `"2026-10-23"` + `"09:00"`) or as a full ISO `starts_at`.
 2. `starts_at` must be on a 30-minute boundary in clinic time (`09:00`, `09:30`, …), with no seconds.
 3. The doctor must be active, and the whole slot must fall inside one of the doctor's working-hour blocks for that weekday.
 4. Past slots are rejected (`past_slot`).
@@ -249,16 +249,20 @@ curl "http://127.0.0.1:8000/api/doctors/1/availability/?date=2026-10-23"
 ```
 ```json
 {"doctor": 1, "date": "2026-10-23", "timezone": "Africa/Nairobi", "slot_minutes": 30,
- "slots": [{"starts_at": "2026-10-23T08:00:00+03:00", "ends_at": "2026-10-23T08:30:00+03:00"}, "..."]}
+ "slots": [{"time": "08:00", "starts_at": "2026-10-23T08:00:00+03:00", "ends_at": "2026-10-23T08:30:00+03:00"}, "..."]}
 ```
 
 ```bash
 # Book
 curl -X POST http://127.0.0.1:8000/api/appointments/ -H "Content-Type: application/json" \
-  -d '{"doctor": 1, "patient": 1, "starts_at": "2026-10-23T09:00:00+03:00"}'
+  -d '{"doctor": 1, "patient": 1, "date": "2026-10-23", "time": "09:00"}'
+
+# Equivalent, with a full timestamp instead of date + time:
+#   -d '{"doctor": 1, "patient": 1, "starts_at": "2026-10-23T09:00:00+03:00"}'
 ```
 ```json
 {"id": 1, "doctor": 1, "doctor_name": "Dr. Amina Odhiambo", "patient": 1, "patient_name": "Demo Patient One",
+ "date": "2026-10-23", "start_time": "09:00", "end_time": "09:30",
  "starts_at": "2026-10-23T09:00:00+03:00", "ends_at": "2026-10-23T09:30:00+03:00", "status": "booked",
  "cancellation_reason": "", "created_at": "...", "updated_at": "..."}
 ```
@@ -269,7 +273,7 @@ curl -X POST http://127.0.0.1:8000/api/appointments/ -H "Content-Type: applicati
 
 # Reschedule
 curl -X PATCH http://127.0.0.1:8000/api/appointments/1/reschedule/ -H "Content-Type: application/json" \
-  -d '{"starts_at": "2026-10-23T09:30:00+03:00"}'
+  -d '{"date": "2026-10-23", "time": "09:30"}'
 
 # Cancel
 curl -X PATCH http://127.0.0.1:8000/api/appointments/1/cancel/ -H "Content-Type: application/json" \
@@ -322,7 +326,7 @@ python manage.py makemigrations --check --dry-run   # CI guard: fails if migrati
 python manage.py test
 ```
 
-27 tests cover: successful booking, duplicate booking (409), patient double booking, outside working
+31 tests cover: booking by `date` + `time` or `starts_at`, admin auto-computing `ends_at`, successful booking, duplicate booking (409), patient double booking, outside working
 hours, days with no hours, misaligned slots, past appointments, the 1-hour notice rule, inactive doctors,
 the DB unique constraint itself, cancellation, blank reason, repeated cancellation, released slots
 (cancel → slot reappears and can be rebooked), successful rescheduling, failed rescheduling (occupied and
@@ -359,7 +363,7 @@ engine:
 2. `manage.py check --deploy --fail-level ERROR`: production-settings sanity checks.
 3. `makemigrations --check --dry-run`: fails if a model change has no migration.
 4. `spectacular --validate --fail-on-warn`: the OpenAPI schema must be valid.
-5. `manage.py test`: the full test suite (27 tests).
+5. `manage.py test`: the full test suite (31 tests).
 
 **CD: Render** (`render.yaml` Blueprint), triggered by a passing commit on `main`:
 

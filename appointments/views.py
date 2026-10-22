@@ -1,6 +1,6 @@
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
-from drf_spectacular.utils import OpenApiResponse, extend_schema
+from drf_spectacular.utils import OpenApiExample, OpenApiResponse, extend_schema
 from rest_framework import generics, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -27,6 +27,18 @@ class AppointmentCreateView(APIView):
         request=AppointmentCreateSerializer,
         responses={201: AppointmentSerializer, **ERROR_RESPONSES},
         summary='Book a 30-minute appointment',
+        description='Pick a free slot from the availability endpoint and send its date and time.',
+        examples=[
+            OpenApiExample(
+                'Date and time', value={'doctor': 1, 'patient': 1, 'date': '2026-10-23', 'time': '09:00'},
+                request_only=True,
+            ),
+            OpenApiExample(
+                'Full starts_at',
+                value={'doctor': 1, 'patient': 1, 'starts_at': '2026-10-23T09:00:00+03:00'},
+                request_only=True,
+            ),
+        ],
     )
     def post(self, request):
         serializer = AppointmentCreateSerializer(data=request.data)
@@ -55,6 +67,9 @@ class AppointmentRescheduleView(APIView):
         request=AppointmentRescheduleSerializer,
         responses={200: AppointmentSerializer, **ERROR_RESPONSES},
         summary='Move an appointment to a new slot',
+        examples=[
+            OpenApiExample('Date and time', value={'date': '2026-10-23', 'time': '10:30'}, request_only=True),
+        ],
     )
     def patch(self, request, pk):
         serializer = AppointmentRescheduleSerializer(data=request.data)

@@ -24,6 +24,7 @@ class AvailabilityQuerySerializer(serializers.Serializer):
 
 
 class SlotSerializer(serializers.Serializer):
+    time = serializers.CharField(help_text='HH:MM in clinic time; send this with `date` to book.')
     starts_at = serializers.DateTimeField()
     ends_at = serializers.DateTimeField()
 
