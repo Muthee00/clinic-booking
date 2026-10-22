@@ -9,6 +9,132 @@ per-doctor weekly working hours, slot availability, and database-level protectio
 > mechanism. Do not deploy this with real patient or medical data until authentication (e.g. token/JWT
 > auth) and per-patient object permissions are added.
 
+## System design
+
+### The problem, restated
+
+> *A small clinic with 5 doctors. Each doctor has set working hours and works in 30-minute slots. A patient
+> sees which slots are free for a doctor on a given day, picks one and books it. Once booked, the slot must
+> not be available to anyone else. Patients can cancel. Start small, but be able to grow.*
+
+From the brief, the system has to:
+
+| # | Requirement from the brief | What it means for the design |
+|---|---|---|
+| R1 | Doctors have set working hours | Store a weekly schedule per doctor, separate from bookings |
+| R2 | 30-minute slots | Fixed slot length and a fixed time grid (:00 / :30) |
+| R3 | See free slots for a doctor on a day | Work out availability from schedule minus bookings |
+| R4 | Pick a slot and book it | Validate the slot, then create the booking atomically |
+| R5 | A booked slot must not be available to others | Guarantee no double booking, **even with concurrent requests** |
+| R6 | Patients can cancel | Cancellation releases the slot but keeps the history |
+| R7 | Start small, grow later | Simple monolith now, with clear seams for scaling later |
+
+Things I assumed where the brief says nothing (kept explicit so they're easy to change):
+
+- One clinic, one timezone (`Africa/Nairobi`). Working hours are local wall-clock times.
+- A doctor may have several working blocks a day (e.g. a lunch break).
+- Bookings must be made at least 1 hour in advance and never in the past.
+- A patient can't hold two appointments at the same time, even with different doctors.
+- Rescheduling is a convenience: it's an atomic "cancel + rebook" that keeps the same appointment record.
+
+### Components
+
+```
+                ┌────────────────────────────────────────────────────────────┐
+  HTTP client ─▶│  Django + DRF  (single deployable service)                 │
+  (web / app)   │                                                            │
+                │  URLs ─▶ Views (thin) ─▶ Serializers (input shape/types)   │
+                │                 │                                          │
+                │                 ▼                                          │
+                │        appointments/services.py   ◀── business rules,      │
+                │                 │                     transactions, locks  │
+                │                 ▼                                          │
+                │        Models (Doctor, WorkingHour, Patient, Appointment)  │
+                └─────────────────┬──────────────────────────────────────────┘
+                                  ▼
+                     PostgreSQL (prod) / SQLite (local)
+                     + partial unique indexes = final guard against double booking
+```
+
+| Component | Responsibility |
+|---|---|
+| `doctors` app | Doctors and their weekly working hours; the availability endpoint |
+| `appointments` app | Patients and appointments; booking, cancelling and rescheduling endpoints |
+| `appointments/services.py` | **The only place business rules live.** Views call it; tests target it via the API |
+| Serializers | Input shape/type validation (e.g. "is this a datetime?") and output formatting, **not** business rules |
+| Database constraints | Last line of defence: holds even if application code has a bug or a race slips through |
+| drf-spectacular | OpenAPI schema + Swagger UI, so the API contract is self-documenting |
+
+### Models identified
+
+- **Doctor**: who can be booked (`name`, `specialization`, `is_active`).
+- **DoctorWorkingHour**: the recurring weekly template: `(doctor, weekday, start_time, end_time)`. Several rows per day are allowed.
+- **Patient**: who books (`name`, unique `email`). One patient → many appointments.
+- **Appointment**: the booking itself: `doctor`, `patient`, `starts_at`, `ends_at`, `status` (`booked`/`cancelled`), `cancellation_reason`, timestamps.
+
+A **Slot** is deliberately *not* a table (see decision 1). Full field details are in [Data models](#data-models).
+
+### Key decisions
+
+1. **Slots are computed, not stored.** Availability = the doctor's working blocks for that weekday, cut into
+   30-minute steps, minus active appointments, minus anything in the past or within the 1-hour notice window.
+   This keeps one source of truth (schedule + bookings). Changing a doctor's hours takes effect at once, with no
+   batch job to pre-generate slots and nothing to keep in sync.
+
+2. **No double booking is enforced by the database, not just the code (R5).** A *partial unique index* on
+   `(doctor, starts_at) WHERE status = 'booked'` means only one active appointment per doctor per start time.
+   Slots are fixed-length and grid-aligned, so "same start" is exactly "overlap", and a plain unique index is
+   enough (no range/exclusion constraint needed). Cancelled rows are outside the index, so cancelling frees
+   the slot automatically. A matching index on `(patient, starts_at)` stops a patient double-booking themselves.
+
+3. **Concurrency: lock, then check, then let the constraint decide.** Booking runs in `transaction.atomic()`
+   and locks the doctor row (`SELECT … FOR UPDATE`), so two simultaneous requests for the same doctor run one
+   after the other on PostgreSQL. If anything still races, the unique index rejects the second insert and the
+   API returns **409 Conflict**, never a double booking and never a 500.
+
+4. **Cancellation is a status change, not a delete (R6).** Records keep `status=cancelled` and a required
+   reason. This keeps an audit trail, supports reporting (no-show/cancellation rates) and makes "slot
+   released" fall out of decision 2 for free.
+
+5. **Business rules live in one service module.** Views stay thin. That makes the rules easy to read and
+   test, and lets other entry points (admin actions, a future background job or message consumer) reuse
+   them.
+
+6. **The server owns time.** Clients send only `starts_at`; the server computes `ends_at` and validates the
+   grid. All datetimes are timezone-aware (stored in UTC, presented in `Africa/Nairobi`).
+
+7. **Meaningful HTTP semantics.** 400 = your request breaks a rule (misaligned, outside hours, too soon);
+   409 = valid request but conflicts with current state (slot taken, already cancelled); 404 = unknown ID.
+   Every business error carries a stable machine-readable `code` for clients.
+
+8. **Integer IDs.** Simple and fast for a small system. (See trade-offs: they're guessable.)
+
+### Trade-offs considered
+
+| Decision | Alternative considered | Why I chose this (and the cost) |
+|---|---|---|
+| Computed slots | Pre-generated `Slot` rows per doctor/day | No sync job and no stale data. **Cost:** availability is computed per request, which is trivial at 5 doctors × ~18 slots/day. A `Slot` table would make sense if slots needed their own state (e.g. "held" during checkout). |
+| Unique index on start time | PostgreSQL `ExclusionConstraint` on a `tstzrange` | Works on both SQLite and Postgres, and is simple. **Cost:** relies on fixed 30-min, grid-aligned slots. Variable-length appointments would need the exclusion constraint (Postgres-only). |
+| Pessimistic lock on doctor row | Optimistic (just insert, catch `IntegrityError`) or serialisable isolation | Clear errors and predictable behaviour; the lock is held for milliseconds. **Cost:** bookings for the *same* doctor are serialised. Fine at clinic scale; the unique index alone would still be correct without the lock. |
+| Soft-cancel (status) | Delete the row | Keeps history and an audit trail. **Cost:** queries must filter on `status`; covered by an index. |
+| Weekly working-hours template | Calendar of explicit dates | Matches "set working hours", easy to seed and edit. **Cost:** no holidays/leave or one-off overrides yet (a natural next model: `DoctorTimeOff`). |
+| Single timezone | Per-doctor/per-clinic timezone | One clinic, so one zone avoids confusion. **Cost:** a multi-site expansion needs a `Clinic` model with its own timezone. |
+| Monolith with two apps | Separate services | Small team, small scope: one deployable unit, one database, ACID transactions across booking rules. **Cost:** scaling is vertical/horizontal replicas of the same app, which is plenty for now. |
+| No auth (assessment scope) | Token/JWT + per-patient permissions | Time-boxed. **Cost:** unsuitable for real patient data; integer IDs are guessable. This is the first thing to add (see top-of-page warning). |
+| Sync request/response only | Async jobs (email/SMS confirmations) | Nothing in the brief needs it yet. A task queue (Celery/RQ) slots in later at the service layer. |
+
+### How this grows
+
+Ordered roughly by likely need:
+
+1. **Authentication & authorisation**: patient accounts, staff/admin roles, object-level permissions.
+2. **Schedule exceptions**: `DoctorTimeOff` / holidays subtracted during availability calculation.
+3. **Notifications**: confirmation/reminder emails or SMS through a background queue, triggered from the service layer.
+4. **Multiple clinics/locations**: a `Clinic` model owning doctors and a timezone.
+5. **Variable appointment types/lengths**: an `AppointmentType` with duration, plus a PostgreSQL exclusion constraint on time ranges.
+6. **Read scaling**: the API is stateless, so add more web instances behind the load balancer; cache availability per doctor/day and invalidate on booking/cancel; use Postgres read replicas if needed.
+7. **Pagination & filtering** on list endpoints, and **rate limiting** on booking to deter abuse.
+
 ## Tech stack
 
 - Python 3.14, Django 6.1, Django REST Framework 3.18
@@ -18,7 +144,7 @@ per-doctor weekly working hours, slot availability, and database-level protectio
 - WhiteNoise for static files, Gunicorn as the WSGI server
 - GitHub Actions CI, Render Blueprint for deployment
 
-## Architecture
+## Code layout
 
 ```
 config/                 project settings, root URLs, WSGI
